@@ -252,21 +252,24 @@ app.get('/api/loads', authMiddleware, async (req, res) => {
 // PAYROLL ROUTES
 // ============================================================
 
-const PAYROLL_VISION_PROMPT = `You are a trucking payroll document analyst. You are given one or more documents (Amazon Relay drop-off history, invoices, settlement sheets, or load summaries).
+// FIX 1: Updated prompt to extract loadsPerDriver per driver
+const PAYROLL_VISION_PROMPT = `You are a trucking payroll document analyst. You are given Amazon Relay drop-off history and/or invoice documents.
 
 Extract the following and return ONLY valid JSON with no explanation, no markdown, no backticks:
 {
   "driverNames": ["string"],
+  "loadsPerDriver": {"Driver Name": 3, "Driver Name 2": 2},
   "loadsCompleted": 0,
   "invoiceTotal": 0,
   "notes": "string or null"
 }
 
 RULES:
-- driverNames: every distinct driver name you can identify across the documents. Empty array if none found.
-- loadsCompleted: total number of completed loads/trips/blocks referenced. 0 if unknown.
-- invoiceTotal: the grand total invoice/settlement dollar amount as a number only (no currency symbols or commas). 0 if not found.
-- Never invent data. Use 0, [], or null when a value is genuinely absent.`;
+- driverNames: every distinct driver name found in the documents
+- loadsPerDriver: exact number of loads/blocks each specific driver completed — key is driver name, value is count. Count how many rows each driver appears in.
+- loadsCompleted: total loads across all drivers
+- invoiceTotal: grand total dollar amount as number only, no symbols. 0 if not found.
+- Never invent data. Use 0, {}, or [] when absent.`;
 
 function fileToContentBlock(file) {
   const mediaType = file.mimetype;
@@ -303,7 +306,7 @@ app.post('/api/process-payroll', upload.fields([{name:'file1',maxCount:1},{name:
       return res.status(400).json({ error: e.message });
     }
 
-    let extracted = { driverNames: [], loadsCompleted: 0, invoiceTotal: 0, notes: 'No files provided' };
+    let extracted = { driverNames: [], loadsPerDriver: {}, loadsCompleted: 0, invoiceTotal: 0, notes: 'No files provided' };
     let filesReadSuccessfully = false;
 
     if (files.length > 0) {
@@ -356,15 +359,6 @@ app.post('/api/process-payroll', upload.fields([{name:'file1',maxCount:1},{name:
 
     const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
 
-    // Assign loads per driver from extracted data
-    const loadsPerDriver = {};
-    if (extracted.driverNames && extracted.driverNames.length > 0) {
-      const totalLoads = extracted.loadsCompleted || 0;
-      extracted.driverNames.forEach((name, i) => {
-        loadsPerDriver[name] = Math.floor(totalLoads / extracted.driverNames.length);
-      });
-    }
-
     const statements = driverNames.map((name) => {
       const driverDeductions = normalizedDeductions.map((d) => ({
         label: d.label,
@@ -375,7 +369,8 @@ app.post('/api/process-payroll', upload.fields([{name:'file1',maxCount:1},{name:
       return {
         driver: name,
         gross: round2(grossPerDriver),
-        loadsCompleted: loadsPerDriver[name] || 0,
+        // FIX 2: Use loadsPerDriver from extracted data by driver name
+        loadsCompleted: extracted.loadsPerDriver?.[name] || 0,
         deductions: driverDeductions,
         totalDeductions: round2(totalDeductions),
         netPay,
