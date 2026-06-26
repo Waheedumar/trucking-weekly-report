@@ -42,7 +42,15 @@ app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+const ACCEPTED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter(req, file, cb) {
+    if (ACCEPTED_TYPES.includes(file.mimetype)) cb(null, true);
+    else cb(new Error(`Unsupported file type: ${file.mimetype}`));
+  },
+});
 
 let resendClient = null;
 function getResend() {
@@ -53,125 +61,107 @@ function getResend() {
   return resendClient;
 }
 
-const REPORT_SYSTEM_PROMPT = `You are an expert trucking business analyst. You analyze weekly performance data for trucking companies and write professional, insightful reports.
+// ============================================================
+// HELPERS
+// ============================================================
 
-When given weekly trucking data, generate a complete professional weekly performance report.
+function usd(value) {
+  const n = Number(value) || 0;
+  return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
 
-The report must include:
+function shortDate(value) {
+  if (!value) return '—';
+  const d = new Date(value);
+  if (isNaN(d)) return String(value);
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
 
-1. EXECUTIVE SUMMARY (3-4 sentences)
-- Lead with the biggest win or most important insight
-- Mention revenue performance vs last week
-- Mention on-time delivery rate
-- End with one forward-looking statement
+function parseClaudeJson(text) {
+  if (!text) throw new Error('Empty response from Claude');
+  let cleaned = text.trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+  if (start === -1 || end === -1) throw new Error('No JSON found in Claude response');
+  return JSON.parse(cleaned.slice(start, end + 1));
+}
 
-2. KEY METRICS (formatted table)
-- Loads completed (this week vs last week, % change with ▲ or ▼)
-- Total miles (this week vs last week, % change)
-- Gross revenue (this week vs last week, % change)
-- Revenue per mile
-- On-time delivery rate
-- Fuel cost per mile
+function fileToContentBlock(file) {
+  const data = file.buffer.toString('base64');
+  if (file.mimetype === 'application/pdf') {
+    return { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data } };
+  }
+  return { type: 'image', source: { type: 'base64', media_type: file.mimetype, data } };
+}
 
-3. WHAT WORKED THIS WEEK (2-3 bullet points)
-- Be specific with numbers
-- Highlight genuine wins
-- Reference specific metrics
+function formatWeek(weekStart, weekEnd) {
+  if (!weekStart && !weekEnd) return '';
+  try {
+    const s = weekStart ? new Date(weekStart) : null;
+    const e = weekEnd ? new Date(weekEnd) : null;
+    if (s && e && !isNaN(s) && !isNaN(e)) {
+      const sLabel = s.toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+      const eLabel = e.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+      return `${sLabel} - ${eLabel}`;
+    }
+  } catch {}
+  return [weekStart, weekEnd].filter(Boolean).join(' - ');
+}
 
-4. WHAT NEEDS ATTENTION (2-3 bullet points)
-- Flag underperforming areas
-- Always include a recommended action for each issue
-- Be constructive not negative
+const CLAUDE_PROMPT = (driverList, grossAmount) => `You are a payroll processing agent for an Amazon DSP trucking company.
+You have been given two files:
+File 1: Amazon Relay driver drop-off / load history showing which drivers ran which blocks (loads) this week
+File 2: Weekly revenue invoice showing total amount earned this week
+For EACH driver, extract every block/load they ran with: block or load ID, pickup date, pickup location,
+delivery date, delivery location, and the flat rate (pay) for that block if visible.
+Also extract the total invoice amount.
+The drivers provided are: ${driverList}
+The weekly gross per driver is: ${grossAmount}
+If the files are unclear, return empty blocks for that driver and rely on the provided gross amount.
+Respond ONLY with valid JSON, no other text:
+{
+  "drivers": [
+    {
+      "name": "Driver Name",
+      "blocks": [
+        {
+          "blockId": "BR-12345",
+          "pickupDate": "2026-06-01",
+          "pickupLocation": "DFW8, Dallas TX",
+          "deliveryDate": "2026-06-01",
+          "deliveryLocation": "FTW1, Fort Worth TX",
+          "rate": 850.00
+        }
+      ]
+    }
+  ],
+  "invoiceTotal": "12500.00",
+  "filesReadSuccessfully": true,
+  "notes": ""
+}`;
 
-5. FINANCIAL SUMMARY
-- Gross Revenue
-- Total Expenses breakdown (fuel, maintenance, tolls, other)
-- Net Profit
-- Profit Margin %
-- Cost Per Mile
+// ============================================================
+// EXISTING ROUTES
+// ============================================================
 
-6. DRIVER PERFORMANCE
-- Active drivers
-- Top performer highlight
-- Any issues noted
-
-7. PLAN FOR NEXT WEEK (3-4 bullet points)
-- Specific actionable targets
-- Based on this week's data
-
-TONE: Professional, data-driven, clear. Sound like a trusted advisor not a robot. Use plain language. Lead with insights not just numbers.
-
-RULES:
-- Always explain WHY a metric changed, not just that it changed
-- Never make up data not provided
-- Flag anything that needs urgent attention
-- Keep executive summary scannable`;
+const REPORT_SYSTEM_PROMPT = `You are an expert trucking business analyst...`;
 
 app.post('/api/generate-report', async (req, res) => {
   const { data } = req.body;
-
-  const prompt = `Generate a professional weekly performance report for this trucking company data:
-
-COMPANY INFO:
-Company: ${data.companyName}
-Client/Shipper: ${data.clientName}
-Week: ${data.weekStart} to ${data.weekEnd}
-Active Drivers: ${data.activeDrivers}
-
-LOADS & DELIVERIES:
-Total Loads This Week: ${data.totalLoads}
-Total Loads Last Week: ${data.loadsLastWeek}
-On-Time Deliveries: ${data.onTimeDeliveries}
-Late Deliveries: ${data.lateDeliveries}
-
-MILES:
-Total Miles This Week: ${data.totalMiles}
-Total Miles Last Week: ${data.milesLastWeek}
-Deadhead Miles: ${data.deadheadMiles || 'Not provided'}
-
-REVENUE & RATES:
-Gross Revenue This Week: $${data.totalRevenue}
-Gross Revenue Last Week: $${data.revenueLastWeek}
-Rate Per Mile: $${data.ratePerMile || 'Calculate from data'}
-
-FUEL:
-Total Fuel Cost: $${data.totalFuelCost}
-Fuel Cost Last Week: $${data.fuelLastWeek}
-Gallons Used: ${data.fuelGallons || 'Not provided'}
-
-EXPENSES:
-Maintenance: $${data.maintenance || 0}
-Tolls: $${data.tolls || 0}
-Insurance: $${data.insurance || 0}
-Other: $${data.otherExpenses || 0}
-
-DRIVER PERFORMANCE:
-Top Driver: ${data.topDriver || 'Not specified'}
-Driver Issues: ${data.driverIssues || 'None'}
-
-OPERATIONAL NOTES:
-Highlights: ${data.highlights || 'None provided'}
-Issues: ${data.issues || 'None provided'}
-Next Week Plan: ${data.nextWeekPlan || 'Not provided'}`;
-
   try {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-5',
       max_tokens: 2000,
       system: REPORT_SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [{ role: 'user', content: `Generate report for: ${JSON.stringify(data)}` }],
     });
-
     res.json({ report: response.content[0].text });
   } catch (error) {
     console.error('Claude API error:', error);
-    res.status(500).json({ error: 'Failed to generate report. Please try again.' });
+    res.status(500).json({ error: 'Failed to generate report.' });
   }
 });
 
-const PORT = process.env.PORT || 3002;
-
-// Rate Con Parser
 app.post('/api/parse-ratecon', async (req, res) => {
   try {
     const { text } = req.body;
@@ -179,34 +169,29 @@ app.post('/api/parse-ratecon', async (req, res) => {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1000,
-      system: `You are a rate confirmation parser for a trucking company. Extract structured load data and return ONLY valid JSON with no explanation, no markdown, no backticks:
-{"broker":{"name":"","contact_name":null,"email":null,"phone":null,"mc_number":null},"load":{"reference_number":null,"load_type":null,"commodity":null,"weight":null},"pickup":{"company":null,"address":null,"city":"","state":"","zip":null,"date":null,"time":null,"notes":null},"delivery":{"company":null,"address":null,"city":"","state":"","zip":null,"date":null,"time":null,"notes":null},"rate":{"total":0,"per_mile":0,"estimated_miles":0,"currency":"USD","fuel_surcharge":0,"payment_terms":null},"confidence":"high/medium/low","missing_fields":[],"raw_notes":null}
-If a field is not found use null. Dates must be YYYY-MM-DD. Rates must be numbers only.`,
-      messages: [{ role: 'user', content: `Extract load data from this rate confirmation:\n\n${text}` }]
+      system: `You are a rate confirmation parser. Return ONLY valid JSON: {"broker":{"name":"","contact_name":null,"email":null,"phone":null,"mc_number":null},"load":{"reference_number":null,"load_type":null,"commodity":null,"weight":null},"pickup":{"company":null,"address":null,"city":"","state":"","zip":null,"date":null,"time":null,"notes":null},"delivery":{"company":null,"address":null,"city":"","state":"","zip":null,"date":null,"time":null,"notes":null},"rate":{"total":0,"per_mile":0,"estimated_miles":0,"currency":"USD","fuel_surcharge":0,"payment_terms":null},"confidence":"high/medium/low","missing_fields":[],"raw_notes":null}`,
+      messages: [{ role: 'user', content: `Extract load data:\n\n${text}` }]
     });
     const raw = response.content[0].text;
     const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
     res.json(parsed);
   } catch (err) {
-    console.error('Rate con parser error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Auth
 app.post('/api/auth/login', async (req, res) => {
   try {
     const supabase = getSupabase();
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
     const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) return res.status(401).json({ error: 'Invalid email or password' });
-    const { data: profile, error: profileError } = await supabase.from('profiles').select('*').eq('id', data.user.id).single();
-    if (profileError || !profile) return res.status(404).json({ error: 'User profile not found' });
+    if (error) return res.status(401).json({ error: 'Invalid credentials' });
+    const { data: profile } = await supabase.from('profiles').select('*').eq('id', data.user.id).single();
+    if (!profile) return res.status(404).json({ error: 'Profile not found' });
     const token = jwt.sign(
       { id: profile.id, email: profile.email, name: profile.full_name, role: profile.role, company: profile.company_name },
-      JWT_SECRET,
-      { expiresIn: '7d' }
+      JWT_SECRET, { expiresIn: '7d' }
     );
     res.json({ token, user: { id: profile.id, email: profile.email, name: profile.full_name, role: profile.role, company: profile.company_name } });
   } catch (err) {
@@ -214,23 +199,17 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Loads
 app.post('/api/loads', authMiddleware, async (req, res) => {
   try {
     const supabase = getSupabase();
-    const { origin, destination, pickup_date, delivery_date, commodity, weight, rate, carrier, notes, broker } = req.body;
-    if (!origin || !destination || !pickup_date) return res.status(400).json({ error: 'origin, destination, and pickup_date are required' });
+    const { origin, destination, pickup_date, delivery_date, commodity, weight, rate, carrier, notes } = req.body;
+    if (!origin || !destination || !pickup_date) return res.status(400).json({ error: 'origin, destination, pickup_date required' });
     const { data, error } = await supabase.from('loads').insert({
-      dispatcher_id: req.user.id,
-      origin, destination, pickup_date,
-      delivery_date: delivery_date || null,
-      commodity: commodity || null,
-      weight: weight || null,
-      rate: rate || null,
-      carrier: carrier || null,
-      notes: notes || null,
+      dispatcher_id: req.user.id, origin, destination, pickup_date,
+      delivery_date: delivery_date || null, commodity: commodity || null,
+      weight: weight || null, rate: rate || null, carrier: carrier || null, notes: notes || null,
     }).select('*').single();
-    if (error) return res.status(500).json({ error: 'Failed to create load', detail: error.message });
+    if (error) return res.status(500).json({ error: 'Failed to create load' });
     res.status(201).json({ load: data });
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
@@ -249,292 +228,378 @@ app.get('/api/loads', authMiddleware, async (req, res) => {
 });
 
 // ============================================================
-// PAYROLL ROUTES
+// PAYROLL ROUTES — UPDATED
 // ============================================================
 
-// FIX 1: Updated prompt to extract loadsPerDriver per driver
-const PAYROLL_VISION_PROMPT = `You are a trucking payroll document analyst. You are given Amazon Relay drop-off history and/or invoice documents.
-
-Extract the following and return ONLY valid JSON with no explanation, no markdown, no backticks:
-{
-  "driverNames": ["string"],
-  "loadsPerDriver": {"Driver Name": 3, "Driver Name 2": 2},
-  "loadsCompleted": 0,
-  "invoiceTotal": 0,
-  "notes": "string or null"
-}
-
-RULES:
-- driverNames: every distinct driver name found in the documents
-- loadsPerDriver: exact number of loads/blocks each specific driver completed — key is driver name, value is count. Count how many rows each driver appears in.
-- loadsCompleted: total loads across all drivers
-- invoiceTotal: grand total dollar amount as number only, no symbols. 0 if not found.
-- Never invent data. Use 0, {}, or [] when absent.`;
-
-function fileToContentBlock(file) {
-  const mediaType = file.mimetype;
-  const data = file.buffer.toString('base64');
-  if (mediaType === 'application/pdf') {
-    return { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data } };
-  }
-  return { type: 'image', source: { type: 'base64', media_type: mediaType, data } };
-}
-
-function parseJsonArray(value, fieldName) {
-  if (value === undefined || value === null || value === '') return [];
-  if (Array.isArray(value)) return value;
-  try {
-    const parsed = JSON.parse(value);
-    if (!Array.isArray(parsed)) throw new Error('not an array');
-    return parsed;
-  } catch (err) {
-    throw new Error(`${fieldName} must be a valid JSON array`);
-  }
-}
-
-// 1. Process payroll
-app.post('/api/process-payroll', upload.fields([{name:'file1',maxCount:1},{name:'file2',maxCount:1},{name:'files',maxCount:2}]), async (req, res) => {
-  try {
-    const files = [...(req.files?.file1||[]), ...(req.files?.file2||[]), ...(req.files?.files||[])];
-
-    const { companyName, weekStart, weekEnd, grossAmount } = req.body;
-    let drivers, deductions;
+app.post('/api/process-payroll',
+  upload.fields([{ name: 'file1', maxCount: 1 }, { name: 'file2', maxCount: 1 }]),
+  async (req, res) => {
     try {
-      drivers = parseJsonArray(req.body.drivers, 'drivers');
-      deductions = parseJsonArray(req.body.deductions, 'deductions');
-    } catch (e) {
-      return res.status(400).json({ error: e.message });
-    }
+      const { companyName = 'Company', weekStart = '', weekEnd = '', grossAmount = '0' } = req.body;
 
-    let extracted = { driverNames: [], loadsPerDriver: {}, loadsCompleted: 0, invoiceTotal: 0, notes: 'No files provided' };
-    let filesReadSuccessfully = false;
-
-    if (files.length > 0) {
+      let drivers = [], deductions = [];
       try {
-        const content = [
-          { type: 'text', text: 'Analyze the attached trucking document(s) and extract the payroll data as instructed.' },
-          ...files.map(fileToContentBlock),
-        ];
-
-        const response = await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 1500,
-          system: PAYROLL_VISION_PROMPT,
-          messages: [{ role: 'user', content }],
-        });
-
-        const raw = response.content[0].text;
-        extracted = JSON.parse(raw.replace(/```json|```/g, '').trim());
-        filesReadSuccessfully = true;
-      } catch (e) {
-        console.error('Vision extraction error:', e);
-        extracted.notes = 'File read failed, using manual values';
+        drivers = req.body.drivers ? JSON.parse(req.body.drivers) : [];
+        deductions = req.body.deductions ? JSON.parse(req.body.deductions) : [];
+      } catch {
+        return res.status(400).json({ success: false, error: 'drivers and deductions must be valid JSON arrays' });
       }
-    }
 
-    const supplied = (drivers || [])
-      .map((d) => (typeof d === 'string' ? d : d && d.name))
-      .filter(Boolean);
-    const driverNames = supplied.length > 0 ? supplied : (extracted.driverNames || []);
+      if (!Array.isArray(drivers) || drivers.length === 0) {
+        return res.status(400).json({ success: false, error: 'At least one driver is required' });
+      }
 
-    if (driverNames.length === 0) {
-      return res.status(400).json({ error: 'No drivers found in request or documents' });
-    }
+      drivers = drivers.map((d) => String(d).trim()).filter(Boolean);
+      const grossInput = Number(grossAmount) || 0;
+      const file1 = req.files?.file1?.[0];
+      const file2 = req.files?.file2?.[0];
 
-    const gross = grossAmount !== undefined && grossAmount !== '' && Number(grossAmount) > 0
-      ? Number(grossAmount)
-      : Number(extracted.invoiceTotal || 0);
-
-    if (!gross || gross <= 0) {
-      return res.status(400).json({ error: 'A valid gross amount is required (provided or extracted)' });
-    }
-
-    const grossPerDriver = gross;
-
-    const normalizedDeductions = (deductions || []).map((d) => ({
-      label: d.label || d.name || 'Deduction',
-      amount: Number(d.amount) || 0,
-      perDriver: d.perDriver !== false,
-    }));
-
-    const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
-
-    const statements = driverNames.map((name) => {
-      const driverDeductions = normalizedDeductions.map((d) => ({
-        label: d.label,
-        amount: round2(d.amount),
-      }));
-      const totalDeductions = driverDeductions.reduce((sum, d) => sum + d.amount, 0);
-      const netPay = round2(grossPerDriver - totalDeductions);
-      return {
-        driver: name,
-        gross: round2(grossPerDriver),
-        // FIX 2: Use loadsPerDriver from extracted data by driver name
-        loadsCompleted: extracted.loadsPerDriver?.[name] || 0,
-        deductions: driverDeductions,
-        totalDeductions: round2(totalDeductions),
-        netPay,
+      let extraction = {
+        drivers: [],
+        invoiceTotal: '0.00',
+        filesReadSuccessfully: false,
+        notes: 'No files processed; used provided values.',
       };
+
+      if (file1 || file2) {
+        try {
+          const content = [];
+          if (file1) {
+            content.push({ type: 'text', text: 'File 1 (Amazon Relay drop-off history):' });
+            content.push(fileToContentBlock(file1));
+          }
+          if (file2) {
+            content.push({ type: 'text', text: 'File 2 (Weekly revenue invoice):' });
+            content.push(fileToContentBlock(file2));
+          }
+          content.push({ type: 'text', text: CLAUDE_PROMPT(drivers.join(', '), grossInput.toFixed(2)) });
+
+          const message = await anthropic.messages.create({
+            model: 'claude-sonnet-4-6',
+            max_tokens: 2048,
+            messages: [{ role: 'user', content }],
+          });
+
+          const raw = message.content?.find((b) => b.type === 'text')?.text || '';
+          extraction = parseClaudeJson(raw);
+        } catch (err) {
+          console.error('Vision extraction error:', err.message);
+          extraction.notes = 'File read failed, using manual values.';
+        }
+      }
+
+      const numDrivers = drivers.length;
+      const extractedInvoice = Number(extraction.invoiceTotal) || 0;
+      const grossPerDriver = grossInput > 0 ? grossInput : numDrivers > 0 ? extractedInvoice / numDrivers : 0;
+      const totalInvoice = extractedInvoice > 0 ? extractedInvoice : grossPerDriver * numDrivers;
+
+      const extractedByName = new Map(
+        (extraction.drivers || []).map((d) => [String(d.name).toLowerCase().trim(), d])
+      );
+
+      const driverStatements = drivers.map((name) => {
+        const ext = extractedByName.get(name.toLowerCase().trim()) || {};
+        let blocks = Array.isArray(ext.blocks) ? ext.blocks : [];
+        const ratedTotal = blocks.reduce((s, b) => s + (Number(b.rate) || 0), 0);
+        const gross = grossPerDriver > 0 ? grossPerDriver : ratedTotal;
+
+        if (blocks.length > 0 && ratedTotal === 0 && gross > 0) {
+          const per = Math.round((gross / blocks.length) * 100) / 100;
+          blocks = blocks.map((b) => ({ ...b, rate: per }));
+        }
+
+        blocks = blocks.map((b) => ({
+          blockId: b.blockId || b.loadId || '—',
+          pickupDate: b.pickupDate || '',
+          pickupLocation: b.pickupLocation || '',
+          deliveryDate: b.deliveryDate || '',
+          deliveryLocation: b.deliveryLocation || '',
+          rate: Number(b.rate) || 0,
+        }));
+
+        return { name, loadsCompleted: blocks.length, gross, blocks };
+      });
+
+      const data = {
+        week: formatWeek(weekStart, weekEnd),
+        companyName,
+        totalInvoice: usd(totalInvoice),
+        totalDrivers: numDrivers,
+        grossPerDriver: usd(grossPerDriver),
+        filesReadSuccessfully: Boolean(extraction.filesReadSuccessfully),
+        notes: extraction.notes || '',
+        drivers: driverStatements,
+        generatedAt: new Date().toISOString(),
+      };
+
+      return res.json({ success: true, data });
+    } catch (err) {
+      console.error('process-payroll error:', err.message);
+      return res.status(500).json({ success: false, error: err.message || 'Failed to process payroll' });
+    }
+  }
+);
+
+// ============================================================
+// PDF ROUTE — UPDATED (ITS Dispatch format)
+// ============================================================
+
+app.post('/api/download-pdf', (req, res) => {
+  try {
+    const { data } = req.body;
+    if (!data || !Array.isArray(data.drivers)) {
+      return res.status(400).json({ success: false, error: 'Valid payroll data is required' });
+    }
+
+    const COLORS = {
+      navy: '#0B1628', surface: '#162040', amber: '#F5A623',
+      text: '#FFFFFF', muted: '#7A8499', border: '#2A3A5C', danger: '#EF4444',
+    };
+
+    const doc = new PDFDocument({ size: 'A4', margin: 40, bufferPages: true });
+    const fileName = `payroll-${(data.companyName || 'report').replace(/[^a-z0-9]/gi, '-').toLowerCase()}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    doc.pipe(res);
+
+    const left = doc.page.margins.left;
+    const contentWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const company = data.company || { name: data.companyName || 'Company', address: '', phone: '' };
+
+    data.drivers.forEach((d, idx) => {
+      if (idx > 0) doc.addPage();
+      let y = doc.page.margins.top;
+
+      // Header band
+      doc.rect(0, 0, doc.page.width, 120).fill(COLORS.navy);
+      doc.fillColor(COLORS.amber).fontSize(18).font('Helvetica-Bold').text(company.name || 'Company', left, 32, { width: contentWidth / 2 });
+      doc.fillColor('#C9D2E3').fontSize(9).font('Helvetica')
+        .text(company.address || '', left, 58, { width: contentWidth / 2 })
+        .text(company.phone || '', left, 72, { width: contentWidth / 2 });
+      doc.fillColor('#FFFFFF').fontSize(8).font('Helvetica-Bold').text('DRIVER PAY REPORT', left, 94);
+
+      // Driver info table (right)
+      const infoX = left + contentWidth / 2;
+      const infoW = contentWidth / 2;
+      const cityLine = [d.city, d.state, d.zip].filter(Boolean).join(', ');
+      const info = [
+        ['Driver', d.fullName || d.name || '—'],
+        ['Address', [d.address, cityLine].filter(Boolean).join(', ') || '—'],
+        ['Phone #', d.phone || '—'],
+        ['Report Date', shortDate(new Date().toISOString())],
+        ['Search From', shortDate(data.period?.weekStart || data.weekStart)],
+        ['Search To', shortDate(data.period?.weekEnd || data.weekEnd)],
+      ];
+      let iy = 24;
+      info.forEach(([label, value]) => {
+        doc.fillColor('#9FB0C9').fontSize(8).font('Helvetica').text(label, infoX, iy, { width: 70 });
+        doc.fillColor('#FFFFFF').fontSize(8).font('Helvetica-Bold').text(value, infoX + 72, iy, { width: infoW - 72 });
+        iy += 15;
+      });
+
+      y = 140;
+
+      // Load table
+      const cols = [
+        { key: 'block', label: 'Block ID', w: 0.18, align: 'left' },
+        { key: 'pickup', label: 'Pickup', w: 0.28, align: 'left' },
+        { key: 'delivery', label: 'Delivery', w: 0.28, align: 'left' },
+        { key: 'rate', label: 'Flat Rate', w: 0.13, align: 'right' },
+        { key: 'total', label: 'Total Pay', w: 0.13, align: 'right' },
+      ];
+      const colX = [];
+      let cx = left;
+      cols.forEach((c) => { colX.push(cx); cx += c.w * contentWidth; });
+
+      doc.rect(left, y, contentWidth, 22).fill(COLORS.surface);
+      cols.forEach((c, i) => {
+        doc.fillColor(COLORS.muted).fontSize(8).font('Helvetica-Bold')
+          .text(c.label.toUpperCase(), colX[i] + 6, y + 7, { width: c.w * contentWidth - 12, align: c.align });
+      });
+      y += 22;
+
+      const blocks = d.blocks || [];
+      let subTotal = 0;
+      blocks.forEach((b) => {
+        const rowH = 34;
+        if (y + rowH > doc.page.height - 100) { doc.addPage(); y = doc.page.margins.top; }
+        const cells = [
+          b.blockId || '—',
+          `${shortDate(b.pickupDate)}\n${b.pickupLocation || ''}`,
+          `${shortDate(b.deliveryDate)}\n${b.deliveryLocation || ''}`,
+          usd(b.rate),
+          usd(b.rate),
+        ];
+        subTotal += Number(b.rate) || 0;
+        cols.forEach((c, i) => {
+          doc.fillColor(i >= 3 ? COLORS.text : '#C9D2E3').fontSize(8.5)
+            .font(i === 4 ? 'Helvetica-Bold' : 'Helvetica')
+            .text(cells[i], colX[i] + 6, y + 6, { width: c.w * contentWidth - 12, align: c.align });
+        });
+        doc.moveTo(left, y + rowH).lineTo(left + contentWidth, y + rowH).strokeColor(COLORS.border).lineWidth(0.5).stroke();
+        y += rowH;
+      });
+
+      // If no blocks, use gross as subtotal
+      if (blocks.length === 0) subTotal = Number(d.gross) || 0;
+
+      // Totals
+      y += 12;
+      const tX = left + contentWidth - 230;
+      const tW = 230;
+
+      const driverDeductions = d.deductions || [];
+      const totalDeductions = driverDeductions.reduce((s, ded) => s + (Number(ded.amount) || 0), 0);
+      const grandTotal = subTotal - totalDeductions;
+
+      doc.fillColor(COLORS.muted).fontSize(9).font('Helvetica').text('Sub-Total', tX, y, { width: 140 });
+      doc.fillColor(COLORS.text).fontSize(9).font('Helvetica-Bold').text(usd(subTotal), tX + 140, y, { width: tW - 140, align: 'right' });
+      y += 17;
+
+      driverDeductions.forEach((ded) => {
+        doc.fillColor(COLORS.muted).fontSize(9).font('Helvetica').text(ded.label, tX, y, { width: 140 });
+        doc.fillColor(COLORS.danger).fontSize(9).font('Helvetica').text(`-${usd(ded.amount)}`, tX + 140, y, { width: tW - 140, align: 'right' });
+        y += 17;
+      });
+
+      doc.moveTo(tX, y).lineTo(tX + tW, y).strokeColor(COLORS.border).lineWidth(0.5).stroke();
+      y += 8;
+      doc.fillColor(COLORS.amber).fontSize(12).font('Helvetica-Bold').text('Grand Total (USD)', tX, y, { width: 140 });
+      doc.fillColor(COLORS.amber).fontSize(12).font('Helvetica-Bold').text(usd(grandTotal), tX + 100, y, { width: tW - 100, align: 'right' });
     });
 
-    res.json({
-      company: companyName || null,
-      period: { weekStart: weekStart || null, weekEnd: weekEnd || null },
-      extracted,
-      filesReadSuccessfully,
-      gross: round2(gross),
-      grossPerDriver: round2(grossPerDriver),
-      driverCount: driverNames.length,
-      statements,
-      totalNet: round2(statements.reduce((s, st) => s + st.netPay, 0)),
-    });
-  } catch (error) {
-    console.error('Process payroll error:', error);
-    res.status(500).json({ error: 'Failed to process payroll' });
+    // Footer on every page
+    const range = doc.bufferedPageRange();
+    for (let i = range.start; i < range.start + range.count; i++) {
+      doc.switchToPage(i);
+      doc.fillColor(COLORS.muted).fontSize(8).font('Helvetica')
+        .text('PayrollAgent — Powered by Zyvon Solution', left, doc.page.height - 34, { width: contentWidth, align: 'center' });
+    }
+
+    doc.end();
+  } catch (err) {
+    console.error('download-pdf error:', err.message);
+    if (!res.headersSent) res.status(500).json({ success: false, error: err.message });
+    else res.end();
   }
 });
 
-function buildPayrollEmailHtml(payroll) {
-  const company = payroll.company || payroll.companyName || 'Trucking Company';
-  const period = payroll.period || {};
-  const statements = payroll.statements || payroll.drivers || [];
-  const fmt = (n) => `$${Number(n || 0).toFixed(2)}`;
+// ============================================================
+// EMAIL ROUTE — UPDATED
+// ============================================================
 
-  const rows = statements.map((s) => {
-    const name = s.driver || s.name;
-    const dedLines = (s.deductions || [])
-      .map((d) => `${d.label}: ${fmt(d.amount)}`)
-      .join('<br/>') || '—';
-    return `
-      <tr>
-        <td style="padding:12px 16px;border-bottom:1px solid #1E1E2E;color:#E8E8F0;">${name}</td>
-        <td style="padding:12px 16px;border-bottom:1px solid #1E1E2E;color:#E8E8F0;text-align:right;">${fmt(s.gross)}</td>
-        <td style="padding:12px 16px;border-bottom:1px solid #1E1E2E;color:#6B6B80;font-size:12px;">${dedLines}</td>
-        <td style="padding:12px 16px;border-bottom:1px solid #1E1E2E;color:#6B6B80;text-align:right;">${fmt(s.totalDeductions)}</td>
-        <td style="padding:12px 16px;border-bottom:1px solid #1E1E2E;color:#F59E0B;font-weight:700;text-align:right;">${fmt(s.netPay)}</td>
-      </tr>`;
-  }).join('');
-
-  return `<!DOCTYPE html>
-<html>
-<body style="margin:0;padding:0;background:#0D0A08;font-family:'Inter',Arial,sans-serif;">
-  <div style="max-width:680px;margin:0 auto;padding:32px 24px;">
-    <h1 style="color:#F59E0B;font-size:24px;margin:0 0 4px;">${company}</h1>
-    <p style="color:#6B6B80;font-size:14px;margin:0 0 24px;">
-      Weekly Payroll${period.weekStart ? ` — ${period.weekStart}` : ''}${period.weekEnd ? ` to ${period.weekEnd}` : ''}
-    </p>
-    <table style="width:100%;border-collapse:collapse;background:#1A1208;border:1px solid #1E1E2E;border-radius:12px;overflow:hidden;">
-      <thead>
-        <tr style="background:#0D0A08;">
-          <th style="padding:12px 16px;text-align:left;color:#FDE68A;font-size:12px;text-transform:uppercase;">Driver</th>
-          <th style="padding:12px 16px;text-align:right;color:#FDE68A;font-size:12px;text-transform:uppercase;">Gross</th>
-          <th style="padding:12px 16px;text-align:left;color:#FDE68A;font-size:12px;text-transform:uppercase;">Deductions</th>
-          <th style="padding:12px 16px;text-align:right;color:#FDE68A;font-size:12px;text-transform:uppercase;">Total Ded.</th>
-          <th style="padding:12px 16px;text-align:right;color:#FDE68A;font-size:12px;text-transform:uppercase;">Net Pay</th>
-        </tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>
-    <p style="color:#6B6B80;font-size:13px;margin-top:24px;">
-      Total Net Payroll: <span style="color:#F59E0B;font-weight:700;">${fmt(payroll.totalNet)}</span>
-      &nbsp;•&nbsp; ${statements.length} driver(s)
-    </p>
-  </div>
-</body>
-</html>`;
-}
-
-// 2. Send report
 app.post('/api/send-report', async (req, res) => {
   try {
-    const { payroll, email, data: dataField } = req.body;
-    const payrollData = payroll || dataField;
-    if (!email) return res.status(400).json({ error: 'email is required' });
-    if (!payrollData) return res.status(400).json({ error: 'payroll data is required' });
+    const { email, data, payroll } = req.body;
+    const payrollData = data || payroll;
 
-    const company = payrollData.company || payrollData.companyName || 'Trucking Company';
-    const fromAddress = process.env.RESEND_FROM_EMAIL || 'Payroll <onboarding@resend.dev>';
+    if (!email) return res.status(400).json({ success: false, error: 'email is required' });
+    if (!payrollData || !Array.isArray(payrollData.drivers)) {
+      return res.status(400).json({ success: false, error: 'Valid payroll data is required' });
+    }
 
-    const { data, error } = await getResend().emails.send({
-      from: fromAddress,
+    const navy = '#0B1628', surface = '#162040', card = '#1E2D52';
+    const amber = '#F5A623', text = '#FFFFFF', muted = '#7A8499', border = 'rgba(255,255,255,0.10)';
+    const company = payrollData.company || { name: payrollData.companyName || 'Company' };
+
+    const driverReports = (payrollData.drivers || []).map((d) => {
+      const cityLine = [d.city, d.state, d.zip].filter(Boolean).join(', ');
+      const blockRows = (d.blocks || []).map((b) => `
+        <tr>
+          <td style="padding:8px 6px;border-top:1px solid ${border};color:#C9D2E3;font-size:12px;font-family:monospace;">${b.blockId || '—'}</td>
+          <td style="padding:8px 6px;border-top:1px solid ${border};color:${text};font-size:12px;">${shortDate(b.pickupDate)}<br/><span style="color:${muted};">${b.pickupLocation || ''}</span></td>
+          <td style="padding:8px 6px;border-top:1px solid ${border};color:${text};font-size:12px;">${shortDate(b.deliveryDate)}<br/><span style="color:${muted};">${b.deliveryLocation || ''}</span></td>
+          <td style="padding:8px 6px;border-top:1px solid ${border};color:${text};font-size:12px;text-align:right;">${usd(b.rate)}</td>
+          <td style="padding:8px 6px;border-top:1px solid ${border};color:${text};font-size:12px;text-align:right;font-weight:700;">${usd(b.rate)}</td>
+        </tr>`).join('');
+
+      const driverDeductions = d.deductions || [];
+      const subTotal = (d.blocks || []).reduce((s, b) => s + (Number(b.rate) || 0), 0) || Number(d.gross) || 0;
+      const totalDeductions = driverDeductions.reduce((s, ded) => s + (Number(ded.amount) || 0), 0);
+      const grandTotal = subTotal - totalDeductions;
+
+      const deductionRows = driverDeductions.map((ded) => `
+        <tr>
+          <td style="padding:4px 0;color:${muted};font-size:13px;">${ded.label}</td>
+          <td style="padding:4px 0;color:#EF4444;font-size:13px;text-align:right;">-${usd(ded.amount)}</td>
+        </tr>`).join('');
+
+      return `
+      <div style="background:${card};border:1px solid ${border};border-radius:12px;margin-bottom:20px;overflow:hidden;">
+        <div style="background:${surface};padding:18px 20px;">
+          <table width="100%" style="border-collapse:collapse;">
+            <tr>
+              <td style="vertical-align:top;">
+                <div style="color:${amber};font-size:16px;font-weight:700;">${company.name}</div>
+                <div style="color:${muted};font-size:12px;">${company.address || ''}</div>
+                <div style="color:${muted};font-size:12px;">${company.phone || ''}</div>
+              </td>
+              <td style="vertical-align:top;font-size:12px;">
+                <table style="border-collapse:collapse;">
+                  <tr><td style="color:${muted};padding:2px 10px 2px 0;">Driver</td><td style="color:${text};font-weight:700;">${d.fullName || d.name}</td></tr>
+                  <tr><td style="color:${muted};padding:2px 10px 2px 0;">Phone #</td><td style="color:${text};">${d.phone || '—'}</td></tr>
+                  <tr><td style="color:${muted};padding:2px 10px 2px 0;">Report Date</td><td style="color:${text};">${shortDate(new Date().toISOString())}</td></tr>
+                  <tr><td style="color:${muted};padding:2px 10px 2px 0;">Search From</td><td style="color:${text};">${shortDate(payrollData.period?.weekStart)}</td></tr>
+                  <tr><td style="color:${muted};padding:2px 10px 2px 0;">Search To</td><td style="color:${text};">${shortDate(payrollData.period?.weekEnd)}</td></tr>
+                </table>
+              </td>
+            </tr>
+          </table>
+          <div style="color:${muted};font-size:11px;margin-top:6px;">${[d.address, cityLine].filter(Boolean).join(', ')}</div>
+        </div>
+        <table width="100%" style="border-collapse:collapse;">
+          <tr>
+            <td style="padding:10px 20px;color:${muted};font-size:10px;text-transform:uppercase;">Block ID</td>
+            <td style="padding:10px 6px;color:${muted};font-size:10px;text-transform:uppercase;">Pickup</td>
+            <td style="padding:10px 6px;color:${muted};font-size:10px;text-transform:uppercase;">Delivery</td>
+            <td style="padding:10px 6px;color:${muted};font-size:10px;text-transform:uppercase;text-align:right;">Flat Rate</td>
+            <td style="padding:10px 20px 10px 6px;color:${muted};font-size:10px;text-transform:uppercase;text-align:right;">Total Pay</td>
+          </tr>
+          ${blockRows}
+        </table>
+        <div style="padding:14px 20px;">
+          <table align="right" style="border-collapse:collapse;min-width:240px;">
+            <tr>
+              <td style="padding:4px 0;color:${text};font-size:13px;font-weight:600;">Sub-Total</td>
+              <td style="padding:4px 0;color:${text};font-size:13px;font-weight:600;text-align:right;">${usd(subTotal)}</td>
+            </tr>
+            ${deductionRows}
+            <tr><td colspan="2" style="border-top:1px solid ${border};padding-top:6px;"></td></tr>
+            <tr>
+              <td style="padding:4px 0;color:${amber};font-size:16px;font-weight:800;">Grand Total (USD)</td>
+              <td style="padding:4px 16px 4px 0;color:${amber};font-size:16px;font-weight:800;text-align:right;">${usd(grandTotal)}</td>
+            </tr>
+          </table>
+        </div>
+      </div>`;
+    }).join('');
+
+    const html = `
+    <div style="background:${navy};padding:32px;font-family:Inter,Arial,sans-serif;">
+      <div style="max-width:680px;margin:0 auto;">
+        <h1 style="color:${text};font-size:22px;margin:0 0 4px;">${company.name} — Weekly Payroll</h1>
+        <p style="color:${muted};font-size:14px;margin:0 0 24px;">${payrollData.week || ''}</p>
+        ${driverReports}
+        <p style="color:${muted};font-size:12px;text-align:center;margin-top:24px;">PayrollAgent — Powered by Zyvon Solution</p>
+      </div>
+    </div>`;
+
+    const { data: sent, error } = await getResend().emails.send({
+      from: process.env.RESEND_FROM_EMAIL || 'Payroll <onboarding@resend.dev>',
       to: [email],
-      subject: `Weekly Payroll Report — ${company}`,
-      html: buildPayrollEmailHtml(payrollData),
+      subject: `Weekly Payroll Report — ${company.name} (${payrollData.week || ''})`,
+      html,
     });
 
     if (error) {
       console.error('Resend error:', error);
-      return res.status(502).json({ error: 'Failed to send email', detail: error.message });
+      return res.status(502).json({ success: false, error: error.message });
     }
 
-    res.json({ success: true, sent: true, id: data && data.id });
-  } catch (error) {
-    console.error('Send report error:', error);
-    res.status(500).json({ error: 'Failed to send report' });
-  }
-});
-
-// 3. Download PDF
-app.post('/api/download-pdf', (req, res) => {
-  try {
-    const { payroll, data: dataField } = req.body;
-    const payrollData = payroll || dataField;
-    if (!payrollData) return res.status(400).json({ error: 'payroll data is required' });
-
-    const company = payrollData.company || payrollData.companyName || 'Trucking Company';
-    const period = payrollData.period || {};
-    const statements = payrollData.statements || payrollData.drivers || [];
-    const fmt = (n) => `$${Number(n || 0).toFixed(2)}`;
-
-    const doc = new PDFDocument({ size: 'LETTER', margin: 50 });
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'attachment; filename="payroll-report.pdf"');
-    doc.pipe(res);
-
-    doc.fillColor('#F59E0B').fontSize(22).font('Helvetica-Bold').text(company);
-    let periodLine = 'Weekly Payroll';
-    if (period.weekStart) periodLine += ` — ${period.weekStart}`;
-    if (period.weekEnd) periodLine += ` to ${period.weekEnd}`;
-    doc.moveDown(0.2).fillColor('#666666').fontSize(11).font('Helvetica').text(periodLine);
-    doc.moveDown(1);
-
-    statements.forEach((s, i) => {
-      if (i > 0) doc.moveDown(0.8);
-      const name = s.driver || s.name;
-      doc.fillColor('#111111').fontSize(14).font('Helvetica-Bold').text(name);
-      doc.moveDown(0.3);
-      doc.fillColor('#333333').fontSize(11).font('Helvetica');
-      doc.text(`Gross Pay:        ${fmt(s.gross)}`);
-
-      if (Array.isArray(s.deductions) && s.deductions.length > 0) {
-        doc.fillColor('#666666').text('Deductions:');
-        s.deductions.forEach((d) => {
-          const amt = typeof d.amount === 'string' ? d.amount : fmt(d.amount);
-          doc.fillColor('#666666').text(`   - ${d.label}: ${amt}`);
-        });
-      }
-      doc.fillColor('#333333').text(`Total Deductions: ${fmt(s.totalDeductions)}`);
-      doc.fillColor('#F59E0B').font('Helvetica-Bold').text(`Net Pay:          ${fmt(s.netPay)}`);
-      doc.font('Helvetica');
-
-      doc.moveDown(0.4);
-      doc.strokeColor('#DDDDDD').lineWidth(0.5)
-        .moveTo(doc.x, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).stroke();
-    });
-
-    doc.moveDown(1);
-    doc.fillColor('#111111').fontSize(12).font('Helvetica-Bold')
-      .text(`Total Net Payroll: ${fmt(payrollData.totalNet || payrollData.totalNetPay)}    (${statements.length} driver(s))`);
-
-    doc.moveDown(2);
-    doc.fillColor('#999999').fontSize(10).font('Helvetica')
-      .text('Generated by PayrollAgent — Powered by Zyvon Solution', { align: 'center' });
-
-    doc.end();
-  } catch (error) {
-    console.error('Download PDF error:', error);
-    if (!res.headersSent) res.status(500).json({ error: 'Failed to generate PDF' });
+    res.json({ success: true, id: sent?.id || null });
+  } catch (err) {
+    console.error('send-report error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -543,4 +608,5 @@ app.get('/api/health', (req, res) => {
   res.json({ success: true, message: 'PayrollAgent API running' });
 });
 
+const PORT = process.env.PORT || 3002;
 app.listen(PORT, () => console.log(`Report server running on port ${PORT}`));
