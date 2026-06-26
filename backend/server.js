@@ -29,9 +29,7 @@ function authMiddleware(req, res, next) {
     req.user = decoded;
     next();
   } catch (err) {
-    if (err.name === 'TokenExpiredError') {
-      return res.status(401).json({ error: 'Token expired' });
-    }
+    if (err.name === 'TokenExpiredError') return res.status(401).json({ error: 'Token expired' });
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
@@ -60,10 +58,6 @@ function getResend() {
   }
   return resendClient;
 }
-
-// ============================================================
-// HELPERS
-// ============================================================
 
 function usd(value) {
   const n = Number(value) || 0;
@@ -112,12 +106,24 @@ const CLAUDE_PROMPT = (driverList, grossAmount) => `You are a payroll processing
 You have been given two files:
 File 1: Amazon Relay driver drop-off / load history showing which drivers ran which blocks (loads) this week
 File 2: Weekly revenue invoice showing total amount earned this week
-For EACH driver, extract every block/load they ran with: block or load ID, pickup date, pickup location,
-delivery date, delivery location, and the flat rate (pay) for that block if visible.
-Also extract the total invoice amount.
+
+For EACH driver, extract every block/load they ran with:
+- block or load ID (e.g. B-5VBSZ1GTD)
+- pickup date (YYYY-MM-DD format)
+- pickup location (hub code + city + state, e.g. "MSP1 Shakopee, MN 55379")
+- delivery date (YYYY-MM-DD format)
+- delivery location (hub code + city + state)
+- flat rate / pay amount for that specific block (the dollar amount shown next to that trip)
+
+Also extract the total invoice amount from File 2.
+
 The drivers provided are: ${driverList}
 The weekly gross per driver is: ${grossAmount}
-If the files are unclear, return empty blocks for that driver and rely on the provided gross amount.
+
+IMPORTANT: Extract the actual dollar amount shown for each trip/block. In Amazon Relay the amount appears next to each trip row (e.g. $2,705.21, $2,659.31). Use those exact amounts as the rate for each block.
+
+If files are unclear, return empty blocks and use the provided gross amount.
+
 Respond ONLY with valid JSON, no other text:
 {
   "drivers": [
@@ -125,24 +131,20 @@ Respond ONLY with valid JSON, no other text:
       "name": "Driver Name",
       "blocks": [
         {
-          "blockId": "BR-12345",
-          "pickupDate": "2026-06-01",
-          "pickupLocation": "DFW8, Dallas TX",
-          "deliveryDate": "2026-06-01",
-          "deliveryLocation": "FTW1, Fort Worth TX",
-          "rate": 850.00
+          "blockId": "B-5VBSZ1GTD",
+          "pickupDate": "2026-06-12",
+          "pickupLocation": "MSP1 Shakopee, MN 55379",
+          "deliveryDate": "2026-06-14",
+          "deliveryLocation": "MSP9 Brooklyn Park, MN 55445",
+          "rate": 2705.21
         }
       ]
     }
   ],
-  "invoiceTotal": "12500.00",
+  "invoiceTotal": "49693.25",
   "filesReadSuccessfully": true,
   "notes": ""
 }`;
-
-// ============================================================
-// EXISTING ROUTES
-// ============================================================
 
 const REPORT_SYSTEM_PROMPT = `You are an expert trucking business analyst...`;
 
@@ -157,7 +159,6 @@ app.post('/api/generate-report', async (req, res) => {
     });
     res.json({ report: response.content[0].text });
   } catch (error) {
-    console.error('Claude API error:', error);
     res.status(500).json({ error: 'Failed to generate report.' });
   }
 });
@@ -228,7 +229,7 @@ app.get('/api/loads', authMiddleware, async (req, res) => {
 });
 
 // ============================================================
-// PAYROLL ROUTES — UPDATED
+// PAYROLL ROUTES
 // ============================================================
 
 app.post('/api/process-payroll',
@@ -323,6 +324,8 @@ app.post('/api/process-payroll',
       const data = {
         week: formatWeek(weekStart, weekEnd),
         companyName,
+        weekStart,
+        weekEnd,
         totalInvoice: usd(totalInvoice),
         totalDrivers: numDrivers,
         grossPerDriver: usd(grossPerDriver),
@@ -341,7 +344,7 @@ app.post('/api/process-payroll',
 );
 
 // ============================================================
-// PDF ROUTE — UPDATED (ITS Dispatch format)
+// PDF ROUTE — White background, navy/amber theme
 // ============================================================
 
 app.post('/api/download-pdf', (req, res) => {
@@ -351,78 +354,143 @@ app.post('/api/download-pdf', (req, res) => {
       return res.status(400).json({ success: false, error: 'Valid payroll data is required' });
     }
 
-    const COLORS = {
-      navy: '#0B1628', surface: '#162040', amber: '#F5A623',
-      text: '#FFFFFF', muted: '#7A8499', border: '#2A3A5C', danger: '#EF4444',
+    const C = {
+      navy:    '#0B1628',
+      navyMid: '#162040',
+      amber:   '#F5A623',
+      white:   '#FFFFFF',
+      offWhite:'#F4F6FA',
+      dark:    '#1A202C',
+      muted:   '#7A8499',
+      border:  '#E2E8F0',
+      danger:  '#DC2626',
+      tableHdr:'#0B1628',
+      tableAlt:'#F8F9FC',
     };
 
-    const doc = new PDFDocument({ size: 'A4', margin: 40, bufferPages: true });
+    const doc = new PDFDocument({ size: 'A4', margin: 0, bufferPages: true });
     const fileName = `payroll-${(data.companyName || 'report').replace(/[^a-z0-9]/gi, '-').toLowerCase()}.pdf`;
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
     doc.pipe(res);
 
-    const left = doc.page.margins.left;
-    const contentWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
-    const company = data.company || { name: data.companyName || 'Company', address: '', phone: '' };
+    const PAD = 40;
+    const pageW = doc.page.width;
+    const pageH = doc.page.height;
+    const contentW = pageW - PAD * 2;
+    const company = data.company || {
+      name: data.companyName || 'Company',
+      address: data.companyAddress || '',
+      phone: data.companyPhone || '',
+    };
 
     data.drivers.forEach((d, idx) => {
       if (idx > 0) doc.addPage();
-      let y = doc.page.margins.top;
 
-      // Header band
-      doc.rect(0, 0, doc.page.width, 120).fill(COLORS.navy);
-      doc.fillColor(COLORS.amber).fontSize(18).font('Helvetica-Bold').text(company.name || 'Company', left, 32, { width: contentWidth / 2 });
+      // ── White page background ──
+      doc.rect(0, 0, pageW, pageH).fill(C.white);
+
+      // ── Section 1: Company Header — full width navy band ──
+      const hdrH = 100;
+      doc.rect(0, 0, pageW, hdrH).fill(C.navy);
+
+      doc.fillColor(C.amber).fontSize(20).font('Helvetica-Bold')
+        .text(company.name || 'Company', PAD, 20, { width: contentW });
       doc.fillColor('#C9D2E3').fontSize(9).font('Helvetica')
-        .text(company.address || '', left, 58, { width: contentWidth / 2 })
-        .text(company.phone || '', left, 72, { width: contentWidth / 2 });
-      doc.fillColor('#FFFFFF').fontSize(8).font('Helvetica-Bold').text('DRIVER PAY REPORT', left, 94);
+        .text(company.address || '', PAD, 48, { width: contentW })
+        .text(company.phone || '', PAD, 62, { width: contentW });
+      doc.fillColor(C.white).fontSize(9).font('Helvetica-Bold')
+        .text('DRIVER PAY REPORT', PAD, 80);
 
-      // Driver info table (right)
-      const infoX = left + contentWidth / 2;
-      const infoW = contentWidth / 2;
+      // ── Section 2: Driver Info — light grey band, 3 columns ──
+      const drvH = 100;
+      doc.rect(0, hdrH, pageW, drvH).fill(C.offWhite);
+      // amber top border
+      doc.rect(0, hdrH, pageW, 2).fill(C.amber);
+
       const cityLine = [d.city, d.state, d.zip].filter(Boolean).join(', ');
-      const info = [
+      const driverAddress = d.address || '—';
+      const driverCity = cityLine || '';
+
+      const col1 = [
         ['Driver', d.fullName || d.name || '—'],
-        ['Address', [d.address, cityLine].filter(Boolean).join(', ') || '—'],
+        ['Address', driverAddress],
+        ['', driverCity],
+      ];
+      const col2 = [
         ['Phone #', d.phone || '—'],
         ['Report Date', shortDate(new Date().toISOString())],
-        ['Search From', shortDate(data.period?.weekStart || data.weekStart)],
-        ['Search To', shortDate(data.period?.weekEnd || data.weekEnd)],
       ];
-      let iy = 24;
-      info.forEach(([label, value]) => {
-        doc.fillColor('#9FB0C9').fontSize(8).font('Helvetica').text(label, infoX, iy, { width: 70 });
-        doc.fillColor('#FFFFFF').fontSize(8).font('Helvetica-Bold').text(value, infoX + 72, iy, { width: infoW - 72 });
-        iy += 15;
+      const col3 = [
+        ['Search From', shortDate(data.weekStart || data.period?.weekStart)],
+        ['Search To', shortDate(data.weekEnd || data.period?.weekEnd)],
+      ];
+
+      const colW = contentW / 3;
+      const drvY = hdrH + 12;
+
+      [col1, col2, col3].forEach((col, ci) => {
+        const x = PAD + ci * colW;
+        let rowY = drvY;
+        col.forEach(([label, value]) => {
+          if (label) {
+            doc.fillColor(C.muted).fontSize(8).font('Helvetica')
+              .text(label, x, rowY, { width: colW - 10 });
+            rowY += 13;
+          }
+          if (value) {
+            doc.fillColor(C.dark).fontSize(9).font('Helvetica-Bold')
+              .text(value, x, rowY, { width: colW - 10 });
+            rowY += 16;
+          }
+        });
       });
 
-      y = 140;
+      let y = hdrH + drvH + 10;
 
-      // Load table
+      // ── Section 3: Table Header — navy ──
+      const tblHdrH = 26;
+      doc.rect(PAD, y, contentW, tblHdrH).fill(C.tableHdr);
+
       const cols = [
-        { key: 'block', label: 'Block ID', w: 0.18, align: 'left' },
-        { key: 'pickup', label: 'Pickup', w: 0.28, align: 'left' },
-        { key: 'delivery', label: 'Delivery', w: 0.28, align: 'left' },
-        { key: 'rate', label: 'Flat Rate', w: 0.13, align: 'right' },
-        { key: 'total', label: 'Total Pay', w: 0.13, align: 'right' },
+        { label: 'BLOCK ID',  w: 0.17, align: 'left' },
+        { label: 'PICKUP',    w: 0.275, align: 'left' },
+        { label: 'DELIVERY',  w: 0.275, align: 'left' },
+        { label: 'FLAT RATE', w: 0.14, align: 'right' },
+        { label: 'TOTAL PAY', w: 0.14, align: 'right' },
       ];
       const colX = [];
-      let cx = left;
-      cols.forEach((c) => { colX.push(cx); cx += c.w * contentWidth; });
+      let cx = PAD;
+      cols.forEach((c) => { colX.push(cx); cx += c.w * contentW; });
 
-      doc.rect(left, y, contentWidth, 22).fill(COLORS.surface);
       cols.forEach((c, i) => {
-        doc.fillColor(COLORS.muted).fontSize(8).font('Helvetica-Bold')
-          .text(c.label.toUpperCase(), colX[i] + 6, y + 7, { width: c.w * contentWidth - 12, align: c.align });
+        doc.fillColor(C.amber).fontSize(7.5).font('Helvetica-Bold')
+          .text(c.label, colX[i] + 5, y + 9, { width: c.w * contentW - 10, align: c.align });
       });
-      y += 22;
+      y += tblHdrH;
 
+      // ── Section 4: Table Rows — white/offwhite alternating ──
       const blocks = d.blocks || [];
       let subTotal = 0;
-      blocks.forEach((b) => {
-        const rowH = 34;
-        if (y + rowH > doc.page.height - 100) { doc.addPage(); y = doc.page.margins.top; }
+
+      blocks.forEach((b, bi) => {
+        const rowH = 40;
+        if (y + rowH > pageH - 130) {
+          doc.addPage();
+          doc.rect(0, 0, pageW, pageH).fill(C.white);
+          y = PAD;
+          // Reprint table header on new page
+          doc.rect(PAD, y, contentW, tblHdrH).fill(C.tableHdr);
+          cols.forEach((c, i) => {
+            doc.fillColor(C.amber).fontSize(7.5).font('Helvetica-Bold')
+              .text(c.label, colX[i] + 5, y + 9, { width: c.w * contentW - 10, align: c.align });
+          });
+          y += tblHdrH;
+        }
+
+        const rowBg = bi % 2 === 0 ? C.white : C.tableAlt;
+        doc.rect(PAD, y, contentW, rowH).fill(rowBg);
+
         const cells = [
           b.blockId || '—',
           `${shortDate(b.pickupDate)}\n${b.pickupLocation || ''}`,
@@ -430,50 +498,78 @@ app.post('/api/download-pdf', (req, res) => {
           usd(b.rate),
           usd(b.rate),
         ];
+
         subTotal += Number(b.rate) || 0;
-        cols.forEach((c, i) => {
-          doc.fillColor(i >= 3 ? COLORS.text : '#C9D2E3').fontSize(8.5)
-            .font(i === 4 ? 'Helvetica-Bold' : 'Helvetica')
-            .text(cells[i], colX[i] + 6, y + 6, { width: c.w * contentWidth - 12, align: c.align });
+
+        cells.forEach((cell, i) => {
+          const isAmount = i >= 3;
+          const isTotal = i === 4;
+          doc.fillColor(isTotal ? C.amber : isAmount ? C.dark : C.dark)
+            .fontSize(8.5)
+            .font(isTotal ? 'Helvetica-Bold' : 'Helvetica')
+            .text(cell, colX[i] + 5, y + 7, {
+              width: cols[i].w * contentW - 10,
+              align: cols[i].align,
+              lineGap: 1,
+            });
         });
-        doc.moveTo(left, y + rowH).lineTo(left + contentWidth, y + rowH).strokeColor(COLORS.border).lineWidth(0.5).stroke();
+
+        doc.moveTo(PAD, y + rowH).lineTo(PAD + contentW, y + rowH)
+          .strokeColor(C.border).lineWidth(0.5).stroke();
         y += rowH;
       });
 
-      // If no blocks, use gross as subtotal
       if (blocks.length === 0) subTotal = Number(d.gross) || 0;
 
-      // Totals
-      y += 12;
-      const tX = left + contentWidth - 230;
-      const tW = 230;
-
+      // ── Section 5: Totals — right aligned, light background box ──
+      y += 20;
+      const tW = 250;
+      const tX = PAD + contentW - tW;
       const driverDeductions = d.deductions || [];
       const totalDeductions = driverDeductions.reduce((s, ded) => s + (Number(ded.amount) || 0), 0);
       const grandTotal = subTotal - totalDeductions;
+      const totalsH = 30 + (driverDeductions.length * 24) + 20 + 36;
 
-      doc.fillColor(COLORS.muted).fontSize(9).font('Helvetica').text('Sub-Total', tX, y, { width: 140 });
-      doc.fillColor(COLORS.text).fontSize(9).font('Helvetica-Bold').text(usd(subTotal), tX + 140, y, { width: tW - 140, align: 'right' });
-      y += 17;
+      doc.rect(tX - 10, y - 10, tW + 10, totalsH).fill(C.offWhite);
+      doc.rect(tX - 10, y - 10, tW + 10, 2).fill(C.border);
 
+      // Sub-Total
+      doc.fillColor(C.muted).fontSize(10).font('Helvetica')
+        .text('Sub-Total', tX, y, { width: 140 });
+      doc.fillColor(C.dark).fontSize(10).font('Helvetica-Bold')
+        .text(usd(subTotal), tX + 140, y, { width: tW - 140, align: 'right' });
+      y += 26;
+
+      // Deductions
       driverDeductions.forEach((ded) => {
-        doc.fillColor(COLORS.muted).fontSize(9).font('Helvetica').text(ded.label, tX, y, { width: 140 });
-        doc.fillColor(COLORS.danger).fontSize(9).font('Helvetica').text(`-${usd(ded.amount)}`, tX + 140, y, { width: tW - 140, align: 'right' });
-        y += 17;
+        doc.fillColor(C.muted).fontSize(9).font('Helvetica')
+          .text(ded.label, tX, y, { width: 140 });
+        doc.fillColor(C.danger).fontSize(9).font('Helvetica')
+          .text(`-${usd(ded.amount)}`, tX + 140, y, { width: tW - 140, align: 'right' });
+        y += 22;
       });
 
-      doc.moveTo(tX, y).lineTo(tX + tW, y).strokeColor(COLORS.border).lineWidth(0.5).stroke();
-      y += 8;
-      doc.fillColor(COLORS.amber).fontSize(12).font('Helvetica-Bold').text('Grand Total (USD)', tX, y, { width: 140 });
-      doc.fillColor(COLORS.amber).fontSize(12).font('Helvetica-Bold').text(usd(grandTotal), tX + 100, y, { width: tW - 100, align: 'right' });
+      // Divider
+      doc.moveTo(tX, y).lineTo(tX + tW, y)
+        .strokeColor(C.border).lineWidth(0.5).stroke();
+      y += 12;
+
+      // Grand Total
+      doc.fillColor(C.navy).fontSize(13).font('Helvetica-Bold')
+        .text('Grand Total (USD)', tX, y, { width: 140 });
+      doc.fillColor(C.amber).fontSize(13).font('Helvetica-Bold')
+        .text(usd(grandTotal), tX + 100, y, { width: tW - 100, align: 'right' });
     });
 
-    // Footer on every page
+    // ── Footer on every page ──
     const range = doc.bufferedPageRange();
     for (let i = range.start; i < range.start + range.count; i++) {
       doc.switchToPage(i);
-      doc.fillColor(COLORS.muted).fontSize(8).font('Helvetica')
-        .text('PayrollAgent — Powered by Zyvon Solution', left, doc.page.height - 34, { width: contentWidth, align: 'center' });
+      // Navy footer bar
+      doc.rect(0, pageH - 36, pageW, 36).fill(C.navy);
+      doc.fillColor(C.muted).fontSize(8).font('Helvetica')
+        .text('PayrollAgent — Powered by Zyvon Solution',
+          PAD, pageH - 22, { width: contentW, align: 'center' });
     }
 
     doc.end();
@@ -485,7 +581,7 @@ app.post('/api/download-pdf', (req, res) => {
 });
 
 // ============================================================
-// EMAIL ROUTE — UPDATED
+// EMAIL ROUTE
 // ============================================================
 
 app.post('/api/send-report', async (req, res) => {
@@ -499,7 +595,7 @@ app.post('/api/send-report', async (req, res) => {
     }
 
     const navy = '#0B1628', surface = '#162040', card = '#1E2D52';
-    const amber = '#F5A623', text = '#FFFFFF', muted = '#7A8499', border = 'rgba(255,255,255,0.10)';
+    const amber = '#F5A623', text = '#FFFFFF', muted = '#A0AEC0', border = 'rgba(255,255,255,0.10)';
     const company = payrollData.company || { name: payrollData.companyName || 'Company' };
 
     const driverReports = (payrollData.drivers || []).map((d) => {
@@ -510,7 +606,7 @@ app.post('/api/send-report', async (req, res) => {
           <td style="padding:8px 6px;border-top:1px solid ${border};color:${text};font-size:12px;">${shortDate(b.pickupDate)}<br/><span style="color:${muted};">${b.pickupLocation || ''}</span></td>
           <td style="padding:8px 6px;border-top:1px solid ${border};color:${text};font-size:12px;">${shortDate(b.deliveryDate)}<br/><span style="color:${muted};">${b.deliveryLocation || ''}</span></td>
           <td style="padding:8px 6px;border-top:1px solid ${border};color:${text};font-size:12px;text-align:right;">${usd(b.rate)}</td>
-          <td style="padding:8px 6px;border-top:1px solid ${border};color:${text};font-size:12px;text-align:right;font-weight:700;">${usd(b.rate)}</td>
+          <td style="padding:8px 6px;border-top:1px solid ${border};color:${amber};font-size:12px;text-align:right;font-weight:700;">${usd(b.rate)}</td>
         </tr>`).join('');
 
       const driverDeductions = d.deductions || [];
@@ -521,7 +617,7 @@ app.post('/api/send-report', async (req, res) => {
       const deductionRows = driverDeductions.map((ded) => `
         <tr>
           <td style="padding:4px 0;color:${muted};font-size:13px;">${ded.label}</td>
-          <td style="padding:4px 0;color:#EF4444;font-size:13px;text-align:right;">-${usd(ded.amount)}</td>
+          <td style="padding:4px 0;color:#FF6B6B;font-size:13px;text-align:right;">-${usd(ded.amount)}</td>
         </tr>`).join('');
 
       return `
@@ -539,28 +635,28 @@ app.post('/api/send-report', async (req, res) => {
                   <tr><td style="color:${muted};padding:2px 10px 2px 0;">Driver</td><td style="color:${text};font-weight:700;">${d.fullName || d.name}</td></tr>
                   <tr><td style="color:${muted};padding:2px 10px 2px 0;">Phone #</td><td style="color:${text};">${d.phone || '—'}</td></tr>
                   <tr><td style="color:${muted};padding:2px 10px 2px 0;">Report Date</td><td style="color:${text};">${shortDate(new Date().toISOString())}</td></tr>
-                  <tr><td style="color:${muted};padding:2px 10px 2px 0;">Search From</td><td style="color:${text};">${shortDate(payrollData.period?.weekStart)}</td></tr>
-                  <tr><td style="color:${muted};padding:2px 10px 2px 0;">Search To</td><td style="color:${text};">${shortDate(payrollData.period?.weekEnd)}</td></tr>
+                  <tr><td style="color:${muted};padding:2px 10px 2px 0;">Search From</td><td style="color:${text};">${shortDate(payrollData.weekStart || payrollData.period?.weekStart)}</td></tr>
+                  <tr><td style="color:${muted};padding:2px 10px 2px 0;">Search To</td><td style="color:${text};">${shortDate(payrollData.weekEnd || payrollData.period?.weekEnd)}</td></tr>
                 </table>
               </td>
             </tr>
           </table>
           <div style="color:${muted};font-size:11px;margin-top:6px;">${[d.address, cityLine].filter(Boolean).join(', ')}</div>
         </div>
-        <table width="100%" style="border-collapse:collapse;">
-          <tr>
-            <td style="padding:10px 20px;color:${muted};font-size:10px;text-transform:uppercase;">Block ID</td>
-            <td style="padding:10px 6px;color:${muted};font-size:10px;text-transform:uppercase;">Pickup</td>
-            <td style="padding:10px 6px;color:${muted};font-size:10px;text-transform:uppercase;">Delivery</td>
-            <td style="padding:10px 6px;color:${muted};font-size:10px;text-transform:uppercase;text-align:right;">Flat Rate</td>
-            <td style="padding:10px 20px 10px 6px;color:${muted};font-size:10px;text-transform:uppercase;text-align:right;">Total Pay</td>
+        <table width="100%" style="border-collapse:collapse;background:${navy};">
+          <tr style="background:${card};">
+            <td style="padding:10px 20px;color:${amber};font-size:10px;text-transform:uppercase;font-weight:700;">Block ID</td>
+            <td style="padding:10px 6px;color:${amber};font-size:10px;text-transform:uppercase;font-weight:700;">Pickup</td>
+            <td style="padding:10px 6px;color:${amber};font-size:10px;text-transform:uppercase;font-weight:700;">Delivery</td>
+            <td style="padding:10px 6px;color:${amber};font-size:10px;text-transform:uppercase;font-weight:700;text-align:right;">Flat Rate</td>
+            <td style="padding:10px 20px 10px 6px;color:${amber};font-size:10px;text-transform:uppercase;font-weight:700;text-align:right;">Total Pay</td>
           </tr>
           ${blockRows}
         </table>
-        <div style="padding:14px 20px;">
+        <div style="padding:14px 20px;background:${surface};">
           <table align="right" style="border-collapse:collapse;min-width:240px;">
             <tr>
-              <td style="padding:4px 0;color:${text};font-size:13px;font-weight:600;">Sub-Total</td>
+              <td style="padding:4px 0;color:${muted};font-size:13px;">Sub-Total</td>
               <td style="padding:4px 0;color:${text};font-size:13px;font-weight:600;text-align:right;">${usd(subTotal)}</td>
             </tr>
             ${deductionRows}
@@ -603,7 +699,6 @@ app.post('/api/send-report', async (req, res) => {
   }
 });
 
-// Health check
 app.get('/api/health', (req, res) => {
   res.json({ success: true, message: 'PayrollAgent API running' });
 });
